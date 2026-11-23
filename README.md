@@ -12,7 +12,7 @@ El proyecto aborda la automatización de la auditoría de espacios en salas de v
 
 Cómo lo hace, en cuatro pasos (detalle en "Estrategia Algorítmica y Arquitectura"): (1) **OpenCV** corrige la imagen y segmenta la góndola y sus repisas; (2) **YOLO26** detecta los productos dentro de esa ROI; (3) se calcula qué parte del frente queda sin producto; (4) se informa el resultado. En la CPU de un PC de escritorio tarda ~0,5 s por foto en un lote (mediana) y ~2 s una foto suelta, por el arranque del modelo (objetivo RF01: 2 a 5 s).
 
-Estado de las métricas (detalle y fotos en [docs/analisis-resultados.md](docs/analisis-resultados.md)): el detector llega a mAP50 0,950 en el *test* de SKU-110K y a 0,713 en 45 fotos de Kaggle que no vio al entrenar; el sistema completo acierta la alerta en 92% de las fotos de productos envasados (33/36). Los puntos débiles conocidos (frutas a granel, vidrio y reflejos) están en "Estado operativo y pendiente".
+Estado de las métricas (detalle y fotos en [docs/analisis-resultados.md](docs/analisis-resultados.md); medidas el 2026-10-20 con el detector base `yolo26s`, antes del *fine-tuning* de los pesos incluidos, cuyas métricas están en "Estado operativo y pendiente"): el detector llega a mAP50 0,950 en el *test* de SKU-110K y a 0,713 en 45 fotos de Kaggle que no vio al entrenar; el sistema completo acierta la alerta en 92% de las fotos de productos envasados (33/36). Los puntos débiles conocidos (frutas a granel, vidrio y reflejos) están en "Estado operativo y pendiente".
 
 ---
 
@@ -109,7 +109,7 @@ La interfaz va después del pipeline: Walmart pidió priorizar que la lógica fu
 | Base de datos | SQLite (la que trae Django) | Usuarios, análisis, alertas, cámaras y configuración |
 | Pruebas | pytest y pytest-django | `pytest tests/` sin datos, pesos ni GPU |
 | Despliegue | Docker y Docker Compose | `Dockerfile` y `docker-compose.yml` en la raíz |
-| Integración continua | GitHub Actions | Pruebas y `docker build` en cada PR |
+| Integración continua | GitHub Actions | Pruebas y `docker build` en cada push o PR; auditoría de dependencias e imagen cada semana |
 
 React, Angular, Flask, FastAPI y Node.js no se usan: son alternativas del diseño inicial que se descartaron (ver la decisión de la app web con Django, arriba). Versiones exactas: `requirements.txt`.
 
@@ -197,7 +197,7 @@ La especificación técnica (qué recibe y entrega cada etapa, parámetros con s
 
 ## 🚦 Estado Operativo y Pendiente
 
-Al 2026-11-22. Los números #N son los ítems de la bitácora del equipo.
+Al 2026-11-18, salvo lo indicado. Los números #N son los ítems de la bitácora del equipo.
 
 | Módulo o requisito | Estado |
 | :--- | :--- |
@@ -212,8 +212,7 @@ Al 2026-11-22. Los números #N son los ítems de la bitácora del equipo.
 | Reportes Excel, CSV y PDF (RF05, CU04, #7) | Operativo: página "Reportes" de la app web (`src/reporting/export.py`) |
 | Configuración de umbral y cámaras (CU05, #44) | Operativo: página "Configuración" de la app web |
 | Dashboard de disponibilidad (CU03, #43) | Operativo: página "Góndolas" de la app web |
-| Instalación con Docker Compose (#60, #74) | Operativa: probada completa el 2026-11-15 siguiendo el Instructivo del plan de instalación |
-| Instalación en el servidor del CITT (#39) | Descartada el 2026-11-15: ya no se necesita |
+| Instalación con Docker Compose (#60, #74) | Operativa: probada completa el 2026-11-15 (ver "Ejecución con Docker") |
 
 **Limitaciones conocidas** (análisis completo en [docs/analisis-resultados.md](docs/analisis-resultados.md)):
 
@@ -436,7 +435,7 @@ PC de desarrollo), `DJANGO_SECRET_KEY` (obligatoria con `DJANGO_DEBUG=0`),
 defecto sin debug: cookies seguras y redirección a https; `0` en un
 servidor sin TLS).
 
-El CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) corre `pytest` y el `docker build` (con los tests dentro de la imagen) en cada Pull Request hacia `main` y en cada push a `main`; un PR solo se puede mergear con ambos checks en verde.
+El CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) corre `pytest` y el `docker build` (con los tests dentro de la imagen) en cada push a `main` y en cada Pull Request hacia `main`. [.github/workflows/auditoria.yml](.github/workflows/auditoria.yml) corre `pip-audit` sobre las dependencias y Trivy sobre la imagen cada lunes, a mano y en los PR que tocan `requirements.txt` o el `Dockerfile` (ver [docs/auditoria-seguridad.md](docs/auditoria-seguridad.md)).
 
 ### Ejecución con Docker
 
