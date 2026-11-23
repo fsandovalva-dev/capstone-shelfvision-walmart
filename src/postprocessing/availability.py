@@ -1,0 +1,330 @@
+"""Calculo de disponibilidad de la gondola y alerta de quiebre de stock.
+
+Entrada: las cajas de producto detectadas, en el formato estandar
+[x_min, y_min, x_max, y_max], y los niveles de repisa, en el mismo sistema
+de coordenadas: el de la imagen corregida, donde se segmentaron las
+repisas (con lente fisheye, en la imagen original las repisas se ven
+curvas). Un nivel es un bbox [x_min, y_min, x_max, y_max] o, con la
+camara en angulo, una franja inclinada: un cuadrilatero de lados
+verticales ((x0, y_sup0), (x1, y_sup1), (x1, y_inf1), (x0, y_inf0)), como
+los de shelf_levels(). Para no depender de src/preprocessing ni de
+src/models, los niveles y las cajas llegan como tuplas o arrays.
+
+Metrica: cobertura a lo largo de cada repisa. Las cajas de cada nivel se
+proyectan sobre el eje X (en una franja inclinada, la proporcion libre a
+lo largo de la repisa es la misma que en X) y lo que queda sin cubrir son
+los huecos. Solo
+cuenta como hueco un tramo libre de al menos `min_gap_products` anchos de
+producto (la mediana de los anchos en esa repisa): la separacion normal
+entre productos no es espacio vacio. La altura de los productos no se
+mide: una repisa de productos bajos o una pila a la que le quedan pocas
+unidades sigue con producto disponible, y el eje vertical es el que mas
+deforma una camara de sala (vista alta u oblicua).
+
+Alerta: espacio libre >= 30% del frente de la gondola completa (metros
+lineales de repisa). Las repisas son el metodo para medir, no una salida:
+la alerta y el % libre que se informan son solo los de la gondola
+(docs/decisiones-de-diseno.md, "Quiebre por gondola completa"). La profundidad es la
+constante global de 25 cm (ver docs/decisiones-de-diseno.md); el analisis es 2D y el volumen
+libre del Nivel 1 no se informa (#40).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+import numpy as np
+
+BBox = tuple[float, float, float, float]
+Gap = tuple[float, float]
+Point = tuple[float, float]
+Quad = tuple[Point, Point, Point, Point]
+
+# Profundidad de toda gondola (constante global, no se estima).
+GONDOLA_DEPTH_CM = 25.0
+# Fraccion del frente libre desde la que se alerta un quiebre de stock.
+CRITICAL_FREE_FRACTION = 0.30
+# Fraccion del frente tapada (personas, carros) desde la que no se concluye (#77).
+MAX_OCCLUDED_FRACTION = 0.50
+
+
+@dataclass(frozen=True)
+class AvailabilityParams:
+    """critical_free_fraction: espacio libre desde el que se alerta.
+    min_gap_products: ancho minimo de un hueco, en anchos de producto.
+    min_level_overlap: fraccion del alto (de la caja o del nivel, el
+    menor) que una caja debe compartir con un nivel para cubrirlo.
+    trim_to_products: acota la gondola a los productos (ver
+    compute_availability).
+    max_occluded_fraction: con mas frente tapado que esto, la gondola no
+    se mide (inconclusive, sin alerta)."""
+
+    critical_free_fraction: float = CRITICAL_FREE_FRACTION
+    min_gap_products: float = 1.0
+    min_level_overlap: float = 0.3
+    trim_to_products: bool = True
+    max_occluded_fraction: float = MAX_OCCLUDED_FRACTION
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.critical_free_fraction <= 1.0:
+            raise ValueError("critical_free_fraction debe estar en (0, 1].")
+        if self.min_gap_products < 0:
+            raise ValueError("min_gap_products no puede ser negativo.")
+        if not 0.0 < self.min_level_overlap <= 1.0:
+            raise ValueError("min_level_overlap debe estar en (0, 1].")
+        if not 0.0 < self.max_occluded_fraction <= 1.0:
+            raise ValueError("max_occluded_fraction debe estar en (0, 1].")
+
+
+@dataclass(frozen=True)
+class ShelfAvailability:
+    """Medicion de un nivel de repisa (dato interno: no lleva alerta y su
+    % libre no se informa). `level_index` es su posicion en los niveles de
+    entrada; `polygon`, el nivel ya acotado a los productos (sup. izq.,
+    sup. der., inf. der., inf. izq.), y `bbox`, el rectangulo que lo
+    contiene. `gaps` son los tramos [x_inicio, x_fin] sin producto, de
+    izquierda a derecha."""
+
+    level_index: int
+    bbox: BBox
+    product_count: int
+    gaps: tuple[Gap, ...]
+    polygon: Quad
+    occluded_width: float = 0.0  # tramo tapado por una persona u objeto (#77)
+
+    @property
+    def width(self) -> float:
+        return self.bbox[2] - self.bbox[0]
+
+    @property
+    def height(self) -> float:
+        """Alto medio del nivel (en una franja inclinada varia a lo ancho)."""
+        return (self.height_at(self.bbox[0]) + self.height_at(self.bbox[2])) / 2
+
+    def height_at(self, x: float) -> float:
+        (x0, top0), (x1, top1), (_, bottom1), (_, bottom0) = self.polygon
+        t = (x - x0) / (x1 - x0)
+        return (bottom0 - top0) + t * ((bottom1 - top1) - (bottom0 - top0))
+
+    @property
+    def free_width(self) -> float:
+        return sum(end - start for start, end in self.gaps)
+
+    @property
+    def free_fraction(self) -> float:
+        return self.free_width / self.width
+
+    @property
+    def free_area_px(self) -> float:
+        """Area frontal libre (Nivel 1): cada hueco por el alto del nivel
+        en su centro."""
+        return sum((end - start) * self.height_at((start + end) / 2) for start, end in self.gaps)
+
+
+@dataclass(frozen=True)
+class GondolaAvailability:
+    """Disponibilidad de la gondola completa. `free_fraction` y `critical`
+    (la alerta del MVP, Nivel 2) son lo que se informa; `shelves` es la
+    medicion por repisa de la que salen."""
+
+    shelves: tuple[ShelfAvailability, ...]
+    free_fraction: float
+    critical: bool
+    occluded_fraction: float = 0.0
+    inconclusive: bool = False  # demasiado frente tapado: no se informa alerta
+
+    @property
+    def free_area_px(self) -> float:
+        return sum(shelf.free_area_px for shelf in self.shelves)
+
+
+def compute_availability(
+    products: Sequence[BBox] | np.ndarray,
+    levels: Sequence[BBox] | Sequence[Quad] | np.ndarray,
+    params: AvailabilityParams = AvailabilityParams(),
+    occluders: Sequence[BBox] | np.ndarray = (),
+) -> GondolaAvailability:
+    """Disponibilidad de la gondola completa, medida repisa por repisa.
+
+    `levels` son los niveles de repisa, de arriba hacia abajo: bbox
+    (GondolaSegmentation.shelves) o franjas inclinadas (shelf_levels(),
+    que combina la segmentacion con los productos detectados). Si la
+    segmentacion no encontro repisas (found=False), se pasa la ROI como
+    unico nivel: analisis global.
+
+    Con `trim_to_products` (por defecto), la gondola va del primer al
+    ultimo nivel con productos y, a lo ancho, del producto mas a la
+    izquierda al mas a la derecha. La ROI de la segmentacion suele
+    incluir pasillo, techo o carteles, que sin esto cuentan como espacio
+    vacio (en SKU-110K, 24% de falsas alertas con la gondola llena contra
+    4%; ver scripts/evaluate_availability.py). Costo: una repisa extrema
+    vacia por completo, o una franja vacia en todas las repisas en un
+    extremo de la gondola, no se cuentan. Sin ningun producto no se acota
+    y todo es hueco.
+
+    `occluders` son cajas de lo que tapa la gondola (personas, carros), en
+    el mismo sistema de coordenadas. Lo tapado no es espacio libre ni
+    ocupado: se mide solo el frente visible (la fraccion libre es sobre lo
+    visible), y si lo tapado pasa de `max_occluded_fraction` el resultado es
+    `inconclusive` y no alerta (#77).
+    """
+    bands = _as_bands(levels)
+    boxes = _as_boxes(products, "products")
+    boxes = boxes[(boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])]
+    hiders = _as_boxes(occluders, "occluders")
+    hiders = hiders[(hiders[:, 2] > hiders[:, 0]) & (hiders[:, 3] > hiders[:, 1])]
+
+    covering = [_covering_boxes(boxes, band, params.min_level_overlap) for band in bands]
+    stocked = [i for i, level_products in enumerate(covering) if len(level_products)]
+    indices = range(len(bands))
+    if params.trim_to_products and stocked:
+        indices = range(stocked[0], stocked[-1] + 1)
+        in_gondola = np.concatenate([covering[i] for i in stocked])
+        bands = bands.copy()
+        bands[:, 0] = np.maximum(bands[:, 0], in_gondola[:, 0].min())
+        bands[:, 1] = np.minimum(bands[:, 1], in_gondola[:, 2].max())
+    # Ancho de producto de referencia para una repisa sin productos: la
+    # mediana de toda la gondola. Sin ningun producto, todo es hueco.
+    all_widths = boxes[:, 2] - boxes[:, 0]
+    fallback_width = float(np.median(all_widths)) if len(all_widths) else 0.0
+
+    shelves = []
+    for index in indices:
+        band = bands[index]
+        if band[1] <= band[0]:  # nivel fuera del ancho de los productos
+            continue
+        level_products = _covering_boxes(boxes, band, params.min_level_overlap)
+        widths = level_products[:, 2] - level_products[:, 0]
+        reference = float(np.median(widths)) if len(widths) else fallback_width
+        level_hiders = _covering_boxes(hiders, band, params.min_level_overlap)
+        gaps = _free_gaps(band, np.vstack([level_products, level_hiders]), params.min_gap_products * reference)
+        occluded_width = float(band[1] - band[0]) - sum(e - s for s, e in _free_gaps(band, level_hiders, 0.0))
+        polygon = _polygon(band)
+        shelves.append(
+            ShelfAvailability(
+                level_index=index,
+                bbox=(
+                    polygon[0][0],
+                    min(polygon[0][1], polygon[1][1]),
+                    polygon[1][0],
+                    max(polygon[2][1], polygon[3][1]),
+                ),
+                product_count=len(level_products),
+                gaps=gaps,
+                polygon=polygon,
+                occluded_width=occluded_width,
+            )
+        )
+
+    total_width = sum(shelf.width for shelf in shelves)
+    occluded_fraction = sum(shelf.occluded_width for shelf in shelves) / total_width
+    inconclusive = occluded_fraction > params.max_occluded_fraction or occluded_fraction >= 1.0
+    visible_width = total_width * (1.0 - occluded_fraction)
+    free_fraction = sum(shelf.free_width for shelf in shelves) / visible_width if visible_width > 0 else 0.0
+    return GondolaAvailability(
+        shelves=tuple(shelves),
+        free_fraction=free_fraction,
+        critical=not inconclusive and free_fraction >= params.critical_free_fraction,
+        occluded_fraction=occluded_fraction,
+        inconclusive=inconclusive,
+    )
+
+
+def _as_boxes(values: Sequence[BBox] | np.ndarray, name: str) -> np.ndarray:
+    boxes = np.asarray(values, dtype=float).reshape(-1, 4) if len(values) else np.empty((0, 4))
+    if not np.all(np.isfinite(boxes)):
+        raise ValueError(f"{name} tiene coordenadas no finitas.")
+    return boxes
+
+
+def _as_bands(levels: Sequence[BBox] | Sequence[Quad] | np.ndarray) -> np.ndarray:
+    """Niveles como franjas (N, 6): x_min, x_max y las rectas y = m * x + b
+    de sus bordes superior e inferior (m_sup, b_sup, m_inf, b_inf). Un
+    bbox es una franja horizontal."""
+    values = np.asarray(levels, dtype=float) if len(levels) else np.empty((0, 4))
+    if len(values) == 0:
+        raise ValueError("Se necesita al menos un nivel (o la ROI como unico nivel).")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("levels tiene coordenadas no finitas.")
+    if values.ndim == 2 and values.shape[1] == 4:
+        x0, top, x1, bottom = values.T
+        zeros = np.zeros(len(values))
+        bands = np.column_stack([x0, x1, zeros, top, zeros, bottom])
+    elif values.ndim == 3 and values.shape[1:] == (4, 2):
+        top_left, top_right, bottom_right, bottom_left = (values[:, i] for i in range(4))
+        if not (
+            np.allclose(top_left[:, 0], bottom_left[:, 0])
+            and np.allclose(top_right[:, 0], bottom_right[:, 0])
+        ):
+            raise ValueError("Cada nivel inclinado debe tener los lados verticales.")
+        x0, x1 = top_left[:, 0], top_right[:, 0]
+        if np.any(x1 <= x0):
+            raise ValueError("Cada nivel debe tener ancho y alto positivos.")
+        top_slope = (top_right[:, 1] - top_left[:, 1]) / (x1 - x0)
+        bottom_slope = (bottom_right[:, 1] - bottom_left[:, 1]) / (x1 - x0)
+        bands = np.column_stack([
+            x0,
+            x1,
+            top_slope,
+            top_left[:, 1] - top_slope * x0,
+            bottom_slope,
+            bottom_left[:, 1] - bottom_slope * x0,
+        ])
+    else:
+        raise ValueError("Cada nivel es un bbox de 4 valores o un cuadrilatero de 4 puntos.")
+    ends = bands[:, :2].T
+    if np.any(bands[:, 1] <= bands[:, 0]) or np.any(
+        _band_bottom(bands, ends) <= _band_top(bands, ends)
+    ):
+        raise ValueError("Cada nivel debe tener ancho y alto positivos.")
+    return bands
+
+
+def _band_top(band: np.ndarray, x: np.ndarray | float) -> np.ndarray | float:
+    return band[..., 2] * x + band[..., 3]
+
+
+def _band_bottom(band: np.ndarray, x: np.ndarray | float) -> np.ndarray | float:
+    return band[..., 4] * x + band[..., 5]
+
+
+def _polygon(band: np.ndarray) -> Quad:
+    x0, x1 = float(band[0]), float(band[1])
+    return (
+        (x0, float(_band_top(band, x0))),
+        (x1, float(_band_top(band, x1))),
+        (x1, float(_band_bottom(band, x1))),
+        (x0, float(_band_bottom(band, x0))),
+    )
+
+
+def _covering_boxes(boxes: np.ndarray, band: np.ndarray, min_overlap: float) -> np.ndarray:
+    """Cajas que ocupan el nivel: se cruzan con el en X y, a la altura de
+    su centro, comparten con el al menos `min_overlap` del alto menor (el
+    de la caja o el del nivel). Una caja puede cubrir dos niveles: si la
+    segmentacion pone una repisa falsa a media altura de una fila de
+    productos, ninguna de las dos mitades queda vacia."""
+    centers = np.clip((boxes[:, 0] + boxes[:, 2]) / 2, band[0], band[1])
+    top, bottom = _band_top(band, centers), _band_bottom(band, centers)
+    overlap_y = np.minimum(boxes[:, 3], bottom) - np.maximum(boxes[:, 1], top)
+    heights = np.minimum(boxes[:, 3] - boxes[:, 1], bottom - top)
+    overlap_x = np.minimum(boxes[:, 2], band[1]) - np.maximum(boxes[:, 0], band[0])
+    return boxes[(overlap_x > 0) & (overlap_y >= min_overlap * heights)]
+
+
+def _free_gaps(band: np.ndarray, boxes: np.ndarray, min_width: float) -> tuple[Gap, ...]:
+    """Tramos del nivel sin ninguna caja encima (union de las proyecciones
+    en X), descartando los mas angostos que `min_width`."""
+    left, right = float(band[0]), float(band[1])
+    starts = np.clip(boxes[:, 0], left, right).tolist()
+    ends = np.clip(boxes[:, 2], left, right).tolist()
+    gaps = []
+    cursor = left
+    for x_min, x_max in sorted(zip(starts, ends)):
+        if x_min > cursor:
+            gaps.append((cursor, x_min))
+        cursor = max(cursor, x_max)
+    if cursor < right:
+        gaps.append((cursor, right))
+    return tuple((start, end) for start, end in gaps if end - start >= min_width)

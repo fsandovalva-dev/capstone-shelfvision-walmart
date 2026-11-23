@@ -1,0 +1,18 @@
+ultralytics>=8.4.0  # primera version con YOLO26
+opencv-python>=4.8.0,<5  # no headless: ultralytics depende de opencv-python y ambos instalan cv2; <5 hasta validar OpenCV 5
+numpy>=1.24.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+fpdf2>=2.7.0
+pytest>=7.4.0
+python-dotenv>=1.0.0
+py7zr>=1.0  # descomprime SHARD (.7z) en scripts/download_datasets.py, sin depender de un 7z del sistema
+django>=6.1,<7  # app web (item #28); exige Python >= 3.12
+bcrypt>=4.0  # hasher de contrasenas de la app web
+gunicorn>=23.0; sys_platform != "win32"  # sirve la app web en Docker; en Windows, manage.py runserver
+pytest-django>=4.9  # tests de la app web (pytest.ini)
+whitenoise>=6.7  # sirve estilos, fuente e iconos de la app web sin CDN
+pillow>=13.0  # Django valida la foto subida con Pillow (ImageField); 13.0 (2026-10-16) corrige ~35 CVE de decodificadores (docs/auditoria-seguridad.md)
+certifi>=2026.10.19  # quita la CA emSign (incidente de eMudhra); lo trae requests
+filelock>=4.2.1  # lo traen torch y ultralytics; 3.32.3 tiene 13 avisos de pip-audit (docs/auditoria-seguridad.md)
+brotli>=1.2.1  # lo trae py7zr; 1.2.0 tiene PYSEC-2026-4322

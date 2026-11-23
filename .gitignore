@@ -1,0 +1,44 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# --- Secretos ---
+.env
+.env.*
+!.env.example
+
+# --- Datos (no se versionan, solo la estructura) ---
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+web-data/
+
+# --- Imágenes generadas (excepto las de docs/) ---
+*.jpg
+*.jpeg
+*.png
+!docs/**/*.jpg
+!docs/**/*.jpeg
+!docs/**/*.png
+
+# --- Pesos de modelos (solo los dos versionados) ---
+*.pt
+!weights/yolo26s-finetune-ruido-v3.pt
+!weights/yolo26n.pt
+*.onnx
+*.pth
+checkpoints/
+
+# --- Reportes generados ---
+*.xlsx
+*.csv
+*.pdf
+
+# --- IDEs ---
+.vscode/
+.idea/

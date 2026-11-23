@@ -1,0 +1,763 @@
+"""App web (item #28): login por perfil (CU00), usuarios y roles (CU06),
+analisis de fotos (CU01), ciclo de las alertas (CU02), reportes (CU04, #7),
+configuracion de umbral y camaras (CU05, #44) dashboard de gondolas (CU03, #43) y borrado de fotos antiguas (RNF05, #45) con la gondola
+sintetica y el detector falso de pipeline_fixtures (sin pesos de YOLO26)."""
+
+import io
+import json
+import os
+from datetime import timedelta
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pytest
+from PIL import Image
+from django.contrib.auth.models import Group
+from django.core.management import CommandError, call_command
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
+from django.urls import reverse
+from django.utils import timezone
+
+from tests.pipeline_fixtures import ColorDetector, Hider, gondola
+from web import forms, views
+from web.auth import normalize_rut, valid_rut
+from web.models import (ACTIVA, ADMIN, COMPLETADA, EN_PROCESO, JEFE, REEMPLAZADA, REPONEDOR, Analysis, Camera,
+                        Config, User)
+
+pytestmark = pytest.mark.django_db
+PASSWORD = "clave-de-prueba-123"
+EMPTIED = {1: (0.15, 0.85), 2: (0.15, 0.85)}
+
+
+def make_user(rut, role):
+    user = User.objects.create_user(normalize_rut(rut), email=f"{normalize_rut(rut)}@tienda.cl", password=PASSWORD)
+    user.groups.add(Group.objects.get(name=role))
+    return user
+
+
+def login(client, username, password=PASSWORD):
+    return client.post(reverse("login"), {"username": username, "password": password})
+
+
+def photo(empty=None, name="gondola.png"):
+    image, _ = gondola(empty)
+    return SimpleUploadedFile(name, cv2.imencode(".png", image)[1].tobytes(), "image/png")
+
+
+@pytest.fixture
+def analyzer(settings, tmp_path, monkeypatch):
+    """Sube fotos con el detector falso y devuelve el analisis creado."""
+    settings.MEDIA_ROOT = tmp_path
+    monkeypatch.setattr(views, "get_detector", ColorDetector)
+    monkeypatch.setattr(views, "get_person_detector", lambda: None)  # sin cargar COCO
+
+    def upload(client, empty=EMPTIED, pasillo="3", gondola_id="14B"):
+        client.post(reverse("analisis"), {"pasillo": pasillo, "gondola": gondola_id, "foto": photo(empty)})
+        return Analysis.objects.first()
+
+    return upload
+
+
+# --- CU00 ---
+
+@pytest.mark.parametrize("role, home", [(ADMIN, "usuarios"), (JEFE, "gondolas"), (REPONEDOR, "alertas")])
+def test_login_lleva_a_la_vista_de_su_perfil(client, role, home):
+    make_user("11111111-1", role)
+    login(client, "11.111.111-1")  # con puntos: se normaliza
+    assert client.get(reverse("inicio")).url == reverse(home)
+
+
+def test_login_con_correo(client):
+    make_user("1-9", JEFE)
+    assert login(client, "1-9@tienda.cl").url == reverse("inicio")
+
+
+def test_bloquea_15_minutos_tras_5_intentos_sin_desactivar_la_cuenta(client):
+    # #51: con solo saber el RUT se podía desactivar la cuenta de cualquiera, también la del Administrador.
+    user = make_user("1-9", JEFE)
+    for _ in range(5):
+        response = login(client, "1-9", "mala")
+    assert "se bloquea 15 minutos" in response.content.decode()
+    user.refresh_from_db()
+    assert user.is_active and user.locked_until > timezone.now()
+    assert login(client, "1-9").status_code == 200  # bloqueada aunque la clave sea la buena
+
+    User.objects.filter(pk=user.pk).update(locked_until=timezone.now() - timedelta(seconds=1))
+    assert login(client, "1-9").url == reverse("inicio")  # pasados los 15 minutos, entra
+
+
+def test_el_admin_desbloquea_antes_de_tiempo(client):
+    user = make_user("1-9", JEFE)
+    for _ in range(5):
+        login(client, "1-9", "mala")
+    client.force_login(make_user("2-7", ADMIN))
+    client.post(reverse("usuario_editar", args=[user.pk]), {
+        "username": "1-9", "email": user.email, "is_active": "on", "role": JEFE})
+    user.refresh_from_db()
+    assert user.locked_until is None and user.failed_logins == 0
+
+
+def test_intentos_con_la_cuenta_bloqueada_no_alargan_el_bloqueo(client):
+    user = make_user("1-9", JEFE)
+    for _ in range(5):
+        login(client, "1-9", "mala")
+    user.refresh_from_db()
+    until = user.locked_until
+    login(client, "1-9", "mala")
+    user.refresh_from_db()
+    assert user.locked_until == until and user.failed_logins == 0
+
+
+def test_desactivar_cierra_la_sesion_abierta(client):
+    user = make_user("1-9", JEFE)
+    client.force_login(user)
+    user.is_active = False
+    user.save()
+    assert client.get(reverse("analisis")).url.startswith(reverse("login"))
+
+
+def test_cada_perfil_ve_solo_lo_suyo(client):
+    client.force_login(make_user("1-9", REPONEDOR))
+    assert client.get(reverse("usuarios")).status_code == 403
+    assert client.get(reverse("analisis")).status_code == 403
+    assert client.get(reverse("alertas")).status_code == 200
+
+
+# --- CU06 ---
+
+def define_clave(client, link, username):
+    """El usuario abre el enlace sin sesión, define su contraseña y entra con ella."""
+    client.logout()
+    form_url = client.get(link, follow=True).redirect_chain[-1][0]
+    new = "otra-clave-segura-9"
+    client.post(form_url, {"new_password1": new, "new_password2": new})
+    assert client.login(username=username, password=new)
+
+
+def test_admin_crea_usuario_y_ve_en_pantalla_su_enlace_de_un_uso(client, mailoutbox):
+    # #84: el CU06 no usa correo; el Administrador ve el enlace y se lo entrega al usuario.
+    client.force_login(make_user("2-7", ADMIN))
+    response = client.post(reverse("usuario_nuevo"), {
+        "username": "12.345.678-5", "first_name": "Ana", "email": "ana@tienda.cl", "is_active": "on",
+        "role": REPONEDOR})
+    user = User.objects.get(username="12345678-5")
+    assert user.role == REPONEDOR and not user.has_usable_password()
+
+    link = response.context["enlace"]
+    assert link in response.content.decode()
+    assert not mailoutbox
+    define_clave(client, link, "12345678-5")
+    assert not client.get(link, follow=True).context["validlink"]
+
+
+def test_admin_genera_un_enlace_nuevo_si_el_usuario_no_definio_su_clave(client, mailoutbox):
+    user = make_user("1-9", REPONEDOR)
+    user.set_unusable_password()
+    user.save()
+    client.force_login(make_user("2-7", ADMIN))
+    assert "Generar enlace nuevo" in client.get(reverse("usuario_editar", args=[user.pk])).content.decode()
+
+    link = client.post(reverse("usuario_enlace", args=[user.pk])).context["enlace"]
+    assert not mailoutbox
+    define_clave(client, link, "1-9")
+
+
+def test_solo_el_admin_genera_el_enlace(client):
+    user = make_user("1-9", REPONEDOR)
+    client.force_login(make_user("2-7", JEFE))
+    assert client.post(reverse("usuario_enlace", args=[user.pk])).status_code == 403
+
+
+@pytest.mark.parametrize("rut, valid", [
+    ("12345678-5", True), ("11111111-1", True), ("1-9", True), ("12345678-6", False), ("abc-1", False)])
+def test_digito_verificador_del_rut(rut, valid):
+    assert valid_rut(rut) is valid
+
+
+def test_rut_con_digito_malo_no_crea_cuenta(client):
+    client.force_login(make_user("2-7", ADMIN))
+    response = client.post(reverse("usuario_nuevo"), {
+        "username": "12.345.678-6", "email": "x@tienda.cl", "is_active": "on", "role": JEFE})
+    assert "RUT inválido" in response.content.decode()
+    assert not User.objects.filter(email="x@tienda.cl").exists()
+
+
+def test_admin_no_puede_desactivarse_a_si_mismo(client):
+    admin = make_user("2-7", ADMIN)
+    client.force_login(admin)
+    client.post(reverse("usuario_editar", args=[admin.pk]), {
+        "username": "2-7", "email": admin.email, "role": ADMIN})  # sin is_active
+    admin.refresh_from_db()
+    assert admin.is_active
+
+
+# --- CU01 y CU02 ---
+
+def test_analisis_de_foto_abre_alerta_con_ubicacion_y_franjas(client, analyzer):
+    client.force_login(make_user("1-9", JEFE))
+    analysis = analyzer(client)
+    assert analysis.critical and analysis.free_fraction >= 0.3 and analysis.estado == ACTIVA
+    assert analysis.location == "Pasillo 3 · Góndola 14B"
+    assert any(strip["gaps"] for strip in analysis.strips)
+    assert client.get(reverse("alertas")).context["alertas"] == [analysis]
+    assert client.get(reverse("analisis_imagen", args=[analysis.pk]))["Content-Type"] == "image/jpeg"
+
+
+def test_reponedor_toma_y_completa_la_alerta(client, analyzer):
+    client.force_login(make_user("1-9", JEFE))
+    analysis = analyzer(client)
+    reponedor = make_user("2-7", REPONEDOR)
+    client.force_login(reponedor)
+
+    client.post(reverse("alerta_accion", args=[analysis.pk, "tomar"]))
+    analysis.refresh_from_db()
+    assert analysis.estado == EN_PROCESO and analysis.taken_by == reponedor
+
+    client.post(reverse("alerta_accion", args=[analysis.pk, "completar"]))
+    analysis.refresh_from_db()
+    assert analysis.estado == COMPLETADA
+    assert client.get(reverse("alertas")).context["alertas"] == []
+
+
+def test_foto_nueva_reemplaza_la_alerta_o_confirma_la_reposicion(client, analyzer):
+    client.force_login(make_user("1-9", JEFE))
+    first = analyzer(client)
+    second = analyzer(client)  # sigue en quiebre: una sola alerta abierta
+    first.refresh_from_db()
+    assert first.estado == REEMPLAZADA and second.estado == ACTIVA
+
+    analyzer(client, empty={})  # góndola llena: confirma la reposición
+    second.refresh_from_db()
+    assert second.estado == COMPLETADA
+    assert not Analysis.objects.filter(estado__in=[ACTIVA, EN_PROCESO]).exists()
+
+
+def test_pasillo_y_gondola_se_normalizan(client, analyzer):
+    # #49: " a1 " y "A1" son la misma góndola; la foto nueva reemplaza a la alerta abierta.
+    client.force_login(make_user("1-9", JEFE))
+    first = analyzer(client, pasillo=" 3b ", gondola_id="14b ")
+    assert (first.pasillo, first.gondola) == ("3B", "14B")
+    second = analyzer(client, pasillo="3B", gondola_id="14B")
+    first.refresh_from_db()
+    assert first.estado == REEMPLAZADA and second.estado == ACTIVA
+
+
+def test_si_falla_el_guardado_la_alerta_abierta_no_se_cierra(client, analyzer, monkeypatch, settings):
+    # #49: cerrar la alerta vieja y crear el análisis van juntos, o no va ninguno.
+    client.force_login(make_user("1-9", JEFE))
+    open_alert = analyzer(client)
+
+    def fails(*args, **kwargs):
+        raise OSError("disco lleno")
+
+    monkeypatch.setattr(Analysis, "save", fails)
+    with pytest.raises(OSError):
+        analyzer(client)
+    monkeypatch.undo()
+    open_alert.refresh_from_db()
+    assert open_alert.estado == ACTIVA and Analysis.objects.count() == 1
+    assert len(os.listdir(settings.MEDIA_ROOT / "analisis")) == 1  # sin foto huérfana
+
+
+def test_tomar_una_alerta_ya_reemplazada_no_la_reabre(client, analyzer, monkeypatch):
+    # #49: el reponedor tenía la lista abierta y otra foto reemplazó la alerta entremedio.
+    client.force_login(make_user("1-9", JEFE))
+    stale = analyzer(client)
+    analyzer(client)  # reemplaza a `stale` en la base
+    monkeypatch.setattr(views, "get_object_or_404", lambda *a, **k: stale)  # copia vieja, aún "activa"
+    client.force_login(make_user("2-7", REPONEDOR))
+    response = client.post(reverse("alerta_accion", args=[stale.pk, "tomar"]), follow=True)
+    assert "ya cambió de estado" in response.content.decode()
+    stale.refresh_from_db()
+    assert stale.estado == REEMPLAZADA and stale.taken_by is None
+
+
+def test_foto_sin_productos_se_rechaza_y_no_toca_la_alerta_abierta(client, analyzer):
+    # #52: sin detecciones el cálculo daría 100% libre y una alerta falsa (foto tapada u oscura).
+    client.force_login(make_user("1-9", JEFE))
+    open_alert = analyzer(client)
+    blank = SimpleUploadedFile("tapada.png", cv2.imencode(".png", np.full((600, 800, 3), 90, np.uint8))[1].tobytes(),
+                               "image/png")
+    response = client.post(reverse("analisis"), {"pasillo": "3", "gondola": "14B", "foto": blank})
+    assert "No se detectaron productos" in response.content.decode()
+    assert Analysis.objects.count() == 1
+    open_alert.refresh_from_db()
+    assert open_alert.estado == ACTIVA
+
+
+def test_foto_de_camara_defectuosa_no_se_analiza_ni_toca_la_alerta_abierta(client, analyzer):
+    # #87, CU01 excepción 1a: una foto toda verde viene de una cámara fallada.
+    client.force_login(make_user("1-9", JEFE))
+    open_alert = analyzer(client)
+    image, _ = gondola()
+    green = np.zeros_like(image)
+    green[..., 1] = image.mean(axis=2)
+    upload = SimpleUploadedFile("verde.png", cv2.imencode(".png", green)[1].tobytes(), "image/png")
+    response = client.post(reverse("analisis"), {"pasillo": "3", "gondola": "14B", "foto": upload})
+    assert "cámara defectuosa" in response.content.decode()
+    assert Analysis.objects.count() == 1
+    open_alert.refresh_from_db()
+    assert open_alert.estado == ACTIVA
+
+
+def test_foto_demasiado_grande_se_rechaza(client, analyzer, monkeypatch):
+    client.force_login(make_user("1-9", JEFE))
+    monkeypatch.setattr(forms, "MAX_PHOTO_MB", 0)  # cualquier foto supera el límite
+    response = client.post(reverse("analisis"), {"pasillo": "3", "gondola": "1", "foto": photo()})
+    assert "pesa más de" in response.content.decode()
+    assert not Analysis.objects.exists()
+
+
+def test_foto_de_demasiados_megapixeles_se_rechaza(client, analyzer):
+    # #86: un PNG gris casi vacio pesa unos KB (pasa el limite de 20 MB), pero decodificado ocuparia cientos de MB.
+    client.force_login(make_user("1-9", JEFE))
+    png = io.BytesIO()
+    Image.new("L", (8000, 7000)).save(png, "PNG")  # 56 megapixeles
+    big = SimpleUploadedFile("enorme.png", png.getvalue(), "image/png")
+    assert big.size < forms.MAX_PHOTO_MB * 1024 * 1024
+    response = client.post(reverse("analisis"), {"pasillo": "3", "gondola": "1", "foto": big})
+    assert "megapíxeles" in response.content.decode()
+    assert not Analysis.objects.exists()
+
+
+def test_archivo_que_no_es_imagen_se_rechaza(client):
+    client.force_login(make_user("1-9", JEFE))
+    fake = SimpleUploadedFile("foto.jpg", b"no soy una imagen", "image/jpeg")
+    response = client.post(reverse("analisis"), {"pasillo": "3", "gondola": "1", "foto": fake})
+    assert response.context["form"].errors
+    assert not Analysis.objects.exists()
+
+
+# --- #95: analizar una foto o una carpeta indicando su ruta ---
+
+@pytest.fixture
+def carpeta(settings, tmp_path):
+    """La carpeta permitida para las rutas (SHELFVISION_PHOTOS_DIR)."""
+    settings.PHOTOS_DIR = tmp_path / "raw"
+    settings.PHOTOS_DIR.mkdir()
+    return settings.PHOTOS_DIR
+
+
+def save_photo(folder, name, empty=None):
+    cv2.imwrite(str(folder / name), gondola(empty)[0])
+
+
+def post_ruta(client, ruta):
+    return client.post(reverse("analisis"), {"pasillo": "3", "gondola": "14B", "ruta": str(ruta)})
+
+
+def test_ruta_de_una_foto_se_analiza_y_lleva_al_detalle(client, analyzer, carpeta):
+    user = make_user("1-9", JEFE)
+    client.force_login(user)
+    save_photo(carpeta, "a.png", EMPTIED)
+    response = post_ruta(client, "a.png")  # relativa a la carpeta permitida
+    analysis = Analysis.objects.get()
+    assert response.url == reverse("analisis_detalle", args=[analysis.pk])
+    assert (analysis.photo_name, analysis.created_by, analysis.critical) == ("a.png", user, True)
+
+
+def test_ruta_de_una_carpeta_analiza_solo_sus_imagenes(client, analyzer, carpeta):
+    client.force_login(make_user("1-9", JEFE))
+    for name in ("1.png", "2.png", "3.png"):
+        save_photo(carpeta, name)
+    (carpeta / "notas.txt").write_text("no es una foto")
+    response = post_ruta(client, carpeta)  # absoluta, dentro de la carpeta permitida
+    assert response.url == reverse("analisis")
+    assert sorted(Analysis.objects.values_list("photo_name", flat=True)) == ["1.png", "2.png", "3.png"]
+
+
+def test_ruta_fuera_de_la_carpeta_permitida_se_rechaza(client, analyzer, carpeta):
+    client.force_login(make_user("1-9", JEFE))
+    save_photo(carpeta.parent, "fuera.png")
+    for ruta in ("../fuera.png", carpeta.parent):  # con «..» y absoluta
+        assert "fuera de la carpeta permitida" in post_ruta(client, ruta).content.decode()
+    assert not Analysis.objects.exists()
+
+
+def test_ruta_que_no_existe_se_rechaza(client, analyzer, carpeta):
+    client.force_login(make_user("1-9", JEFE))
+    assert "No existe" in post_ruta(client, "nada.png").content.decode()
+    assert not Analysis.objects.exists()
+
+
+def test_hay_que_elegir_una_foto_o_una_ruta_pero_no_las_dos(client, analyzer, carpeta):
+    client.force_login(make_user("1-9", JEFE))
+    save_photo(carpeta, "a.png")
+    neither = client.post(reverse("analisis"), {"pasillo": "3", "gondola": "14B"})
+    both = client.post(reverse("analisis"), {"pasillo": "3", "gondola": "14B", "foto": photo(), "ruta": "a.png"})
+    assert "foto o una ruta" in neither.content.decode()
+    assert "foto o una ruta" in both.content.decode()
+    assert not Analysis.objects.exists()
+
+
+def test_carpeta_con_demasiadas_fotos_se_rechaza(client, analyzer, carpeta, monkeypatch):
+    # Una carpeta de miles de fotos (SKU-110K) tendría la página girando horas.
+    client.force_login(make_user("1-9", JEFE))
+    monkeypatch.setattr(forms, "MAX_FOLDER_PHOTOS", 1)
+    save_photo(carpeta, "1.png")
+    save_photo(carpeta, "2.png")
+    assert "más de 1 fotos" in post_ruta(client, carpeta).content.decode()
+    assert not Analysis.objects.exists()
+
+
+def test_una_foto_mala_de_la_carpeta_no_frena_las_demas(client, analyzer, carpeta):
+    client.force_login(make_user("1-9", JEFE))
+    save_photo(carpeta, "buena.png")
+    (carpeta / "mala.png").write_bytes(b"no soy una imagen")
+    response = post_ruta(client, carpeta)
+    assert response.status_code == 200
+    assert "1 de 2 fotos analizadas" in response.content.decode() and "mala.png" in response.content.decode()
+    assert list(Analysis.objects.values_list("photo_name", flat=True)) == ["buena.png"]
+
+
+def test_foto_ilegible_no_da_error_aunque_pillow_intente_instalar_un_plugin(client, analyzer, carpeta, monkeypatch):
+    # En la imagen Docker (Pillow mas nuevo) Image.open() de un archivo que no es imagen intenta cargar el
+    # plugin pi_heif y levanta ModuleNotFoundError en vez de UnidentifiedImageError: el CI lo vio como un 500.
+    client.force_login(make_user("1-9", JEFE))
+    save_photo(carpeta, "a.png")
+
+    def open_without_plugin(*args, **kwargs):
+        raise ModuleNotFoundError("No module named 'pi_heif'")
+
+    monkeypatch.setattr(views.Image, "open", open_without_plugin)
+    response = post_ruta(client, carpeta)
+    assert response.status_code == 200
+    assert "a.png: no se pudo leer la imagen" in response.content.decode()
+    assert not Analysis.objects.exists()
+
+
+def test_estados_vacios(client):
+    client.force_login(make_user("1-9", JEFE))
+    assert "Sin quiebres abiertos" in client.get(reverse("alertas")).content.decode()
+    assert "Todavía no hay análisis" in client.get(reverse("analisis")).content.decode()
+
+
+def test_no_informa_porcentaje_ni_quiebre_por_repisa(client, analyzer):
+    # Alcance del 2026-10-19 (#40): solo se informan el % libre y la alerta de la góndola completa.
+    client.force_login(make_user("1-9", JEFE))
+    analysis = analyzer(client)
+    assert all(set(strip) == {"number", "gaps"} for strip in analysis.strips)
+    for url in (reverse("alertas"), reverse("analisis_detalle", args=[analysis.pk])):
+        page = client.get(url).content.decode()
+        assert "shelf-free" not in page and "Quiebre en repisa" not in page
+
+
+# --- CU04 ---
+
+def report(client, **params):
+    today = timezone.localdate().isoformat()
+    return client.get(reverse("reportes"), {"desde": today, "hasta": today, "formato": "csv", **params})
+
+
+def test_reporte_csv_trae_una_fila_por_analisis_con_libre_y_alerta(client, analyzer):
+    client.force_login(make_user("1-9", JEFE))
+    analyzer(client)  # con quiebre
+    analyzer(client, empty=None, gondola_id="15")  # góndola llena, sin quiebre
+    response = report(client)
+    assert response["Content-Disposition"].startswith("attachment")
+    header, first, second = response.content.decode("utf-8-sig").splitlines()
+    assert header == "Fecha,Pasillo,Góndola,% libre,Alerta,Estado,Subida por"
+    assert ",3,14B," in first and ",Sí,Activa," in first
+    assert ",3,15," in second and ",No,Sin quiebre," in second
+
+
+def test_reporte_filtra_por_gondola(client, analyzer):
+    client.force_login(make_user("1-9", JEFE))
+    analyzer(client)
+    analyzer(client, empty=None, gondola_id="15")
+    lines = report(client, gondola="15").content.decode("utf-8-sig").splitlines()
+    assert len(lines) == 2 and ",15," in lines[1]
+
+
+@pytest.mark.parametrize("formato, tipo", [("xlsx", "spreadsheetml"), ("pdf", "application/pdf")])
+def test_reporte_excel_y_pdf(client, analyzer, formato, tipo):
+    client.force_login(make_user("1-9", ADMIN))
+    analyzer(client)
+    response = report(client, formato=formato)
+    assert tipo in response["Content-Type"]
+    assert response["Content-Disposition"].endswith(f'.{formato}"')
+
+
+def test_reporte_no_carga_el_json_result(client, analyzer):
+    # #85: el reporte usa 7 campos; traer `result` (10 a 20 KB por foto) agotaba la memoria con meses de historial.
+    client.force_login(make_user("1-9", JEFE))
+    analyzer(client)
+    with CaptureQueriesContext(connection) as queries:
+        assert report(client).status_code == 200
+    assert not any('"web_analysis"."result"' in query["sql"] for query in queries)
+
+
+def test_dashboard_tiene_indice_por_gondola_y_fecha():
+    # #85: sin este indice, el dashboard tardaba 15 s con 15.000 analisis (la consulta crecia al cuadrado).
+    with connection.cursor() as cursor:
+        constraints = connection.introspection.get_constraints(cursor, Analysis._meta.db_table)
+    assert any(c["index"] and c["columns"] == ["pasillo", "gondola", "created_at"] for c in constraints.values())
+
+
+def test_reporte_sin_datos_avisa_y_no_genera_archivo(client):
+    client.force_login(make_user("1-9", JEFE))
+    response = report(client, desde="2020-01-01", hasta="2020-01-31")
+    assert "Content-Disposition" not in response
+    assert "No hay análisis" in response.content.decode()
+
+
+def test_reporte_rechaza_periodo_invertido(client):
+    client.force_login(make_user("1-9", JEFE))
+    response = report(client, desde="2026-10-21", hasta="2026-10-01")
+    assert "Content-Disposition" not in response
+    assert response.context["form"].errors
+
+
+def test_reponedor_no_exporta_reportes(client):
+    client.force_login(make_user("1-9", REPONEDOR))
+    assert client.get(reverse("reportes")).status_code == 403
+
+
+# --- CU05 ---
+
+CALIBRATION = {"camera_matrix": [[800, 0, 399.5], [0, 800, 299.5], [0, 0, 1]],
+               "dist_coeffs": [-0.1, 0, 0, 0], "fisheye": False}
+
+
+def calibration_file(data):
+    return SimpleUploadedFile("calibracion.json", json.dumps(data).encode(), "application/json")
+
+
+def test_admin_cambia_el_umbral_y_rige_para_las_fotos_siguientes(client, analyzer):
+    client.force_login(make_user("2-7", ADMIN))
+    before = analyzer(client)  # 36% libre: con el umbral de 30% por defecto, alerta
+    response = client.post(reverse("configuracion"), {"umbral": 40}, follow=True)
+    assert "Parámetros actualizados" in response.content.decode()
+    after = analyzer(client, gondola_id="15")
+    before.refresh_from_db()
+    assert before.critical and not after.critical  # lo ya analizado no cambia
+    assert "al menos 40%" in client.get(reverse("alertas")).content.decode()
+
+
+@pytest.mark.parametrize("umbral", [0, 101, ""])
+def test_umbral_fuera_de_rango_se_rechaza_y_queda_el_anterior(client, umbral):
+    client.force_login(make_user("2-7", ADMIN))
+    response = client.post(reverse("configuracion"), {"umbral": umbral})
+    assert "Umbral inválido" in response.content.decode()
+    assert Config.get().umbral == 30
+
+
+def test_la_calibracion_de_la_camara_se_usa_al_analizar_su_gondola(client, analyzer, monkeypatch):
+    client.force_login(make_user("2-7", ADMIN))
+    client.post(reverse("camara_nueva"), {
+        "nombre": "Cámara 1", "pasillo": "3", "gondola": "14B", "calibracion": calibration_file(CALIBRATION)})
+    seen = []
+    real = views.run_image
+    monkeypatch.setattr(views, "run_image", lambda image, detector, **kw: seen.append(kw) or real(image, detector, **kw))
+    analyzer(client)  # pasillo 3, góndola 14B: tiene cámara
+    analyzer(client, gondola_id="15")  # sin cámara: solo CLAHE
+    assert seen[0]["calibration"].dist_coeffs[0] == -0.1
+    assert seen[1]["calibration"] is None
+
+
+def test_editar_camara_sin_archivo_conserva_la_calibracion(client):
+    client.force_login(make_user("2-7", ADMIN))
+    client.post(reverse("camara_nueva"), {
+        "nombre": "Cámara 1", "pasillo": "3", "gondola": "14B", "calibracion": calibration_file(CALIBRATION)})
+    camera = Camera.objects.get()
+    client.post(reverse("camara_editar", args=[camera.pk]), {"nombre": "Cámara 1", "pasillo": "4", "gondola": "14B"})
+    camera.refresh_from_db()
+    assert camera.pasillo == "4" and camera.calibracion == CALIBRATION
+
+
+@pytest.mark.parametrize("data", [
+    {"camera_matrix": [[1, 0], [0, 1]], "dist_coeffs": [0, 0, 0, 0]},  # matriz que no es 3x3
+    {"camera_matrix": CALIBRATION["camera_matrix"]},  # faltan los coeficientes
+])
+def test_calibracion_invalida_se_rechaza(client, data):
+    client.force_login(make_user("2-7", ADMIN))
+    response = client.post(reverse("camara_nueva"), {
+        "nombre": "Cámara 1", "pasillo": "3", "gondola": "14B", "calibracion": calibration_file(data)})
+    assert "Calibración inválida" in response.content.decode()
+    assert not Camera.objects.exists()
+
+
+def test_una_gondola_tiene_una_sola_camara(client):
+    client.force_login(make_user("2-7", ADMIN))
+    client.post(reverse("camara_nueva"), {"nombre": "Cámara 1", "pasillo": "3", "gondola": "14B"})
+    response = client.post(reverse("camara_nueva"), {"nombre": "Cámara 2", "pasillo": "3", "gondola": "14B"})
+    assert response.context["form"].errors
+    assert Camera.objects.count() == 1
+
+
+def test_solo_el_admin_configura(client):
+    client.force_login(make_user("1-9", JEFE))
+    assert client.get(reverse("configuracion")).status_code == 403
+    assert client.get(reverse("camara_nueva")).status_code == 403
+
+
+# --- CU03 ---
+
+def tile(page, gondola_id):
+    """Texto de la tarjeta de una góndola en el dashboard."""
+    start = page.index(f"Góndola {gondola_id}<")
+    return page[start:page.index("</article>", start)]
+
+
+def test_dashboard_muestra_el_estado_de_la_ultima_foto_de_cada_gondola(client, analyzer):
+    client.force_login(make_user("1-9", JEFE))
+    analyzer(client)  # 14B: 36% libre, con alerta
+    analyzer(client, empty=None, gondola_id="15")  # 15: llena
+    page = client.get(reverse("gondolas")).content.decode()
+    assert "Quiebre" in tile(page, "14B") and "Disponible" in tile(page, "15")
+
+    analyzer(client, empty=None)  # 14B repuesta: manda la foto más nueva
+    assert "Disponible" in tile(client.get(reverse("gondolas")).content.decode(), "14B")
+
+
+def test_amarillo_desde_la_mitad_del_umbral(client, analyzer):
+    client.force_login(make_user("2-7", ADMIN))
+    client.post(reverse("configuracion"), {"umbral": 70})  # 36% libre: sobre la mitad (35%), bajo el umbral
+    analyzer(client)
+    tile_text = tile(client.get(reverse("gondolas")).content.decode(), "14B")
+    assert "En riesgo" in tile_text and "Quiebre" not in tile_text
+
+
+def test_sin_foto_reciente_o_camara_sin_fotos_es_sin_datos(client, analyzer):
+    client.force_login(make_user("2-7", ADMIN))
+    client.post(reverse("camara_nueva"), {"nombre": "Cámara 9", "pasillo": "9", "gondola": "1"})
+    old = analyzer(client)
+    Analysis.objects.filter(pk=old.pk).update(created_at=timezone.now() - views.RECENT - timedelta(minutes=1))
+    page = client.get(reverse("gondolas")).content.decode()
+    assert "Sin datos" in tile(page, "14B") and "Sin datos" in tile(page, "1")
+
+
+def test_detalle_de_gondola_con_su_historial(client, analyzer):
+    client.force_login(make_user("2-7", JEFE))
+    first = analyzer(client)
+    second = analyzer(client, empty=None)
+    analyzer(client, gondola_id="15")  # otra góndola: no va en el historial
+    client.force_login(make_user("1-9", REPONEDOR))  # el reponedor también lo ve
+    response = client.get(reverse("gondola_detalle", args=["3", "14B"]))
+    history = list(response.context["historial"])
+    assert history == [second, first]
+    assert "Disponible" in response.content.decode()
+
+
+def test_dashboard_vacio(client):
+    client.force_login(make_user("1-9", REPONEDOR))
+    assert "Todavía no hay góndolas" in client.get(reverse("gondolas")).content.decode()
+
+
+# --- RNF05: privacidad de las fotos ---
+
+def test_borrar_fotos_antiguas_conserva_el_analisis(client, analyzer, capsys):
+    # #45: las fotos pueden mostrar clientes; tras N días se borra la foto y se conservan los datos.
+    client.force_login(make_user("1-9", JEFE))
+    old, recent = analyzer(client), analyzer(client, gondola_id="15")
+    Analysis.objects.filter(pk=old.pk).update(created_at=timezone.now() - timedelta(days=31))
+    old_file = old.annotated.path
+    call_command("borrar_fotos", dias=30)
+    assert "1 foto" in capsys.readouterr().out
+    old.refresh_from_db()
+    recent.refresh_from_db()
+    assert not old.annotated and recent.annotated
+    assert old.free_fraction > 0.3 and old.critical  # el resultado queda
+    assert not os.path.exists(old_file)
+    assert client.get(reverse("analisis_imagen", args=[old.pk])).status_code == 404
+    page = client.get(reverse("analisis_detalle", args=[old.pk])).content.decode()
+    assert "La foto se borró" in page
+
+
+def test_borrar_fotos_rechaza_dias_invalidos():
+    with pytest.raises(CommandError, match="al menos 1"):
+        call_command("borrar_fotos", dias=0)
+
+
+# --- Camara de sala simulada (#58) ---
+
+def test_simular_camara_registra_la_camara_y_analiza_las_fotos_degradadas(analyzer, tmp_path, capsys):
+    carpeta = tmp_path / "fotos"
+    carpeta.mkdir()
+    for nombre, vacio in (("llena.png", None), ("vacia.png", EMPTIED)):
+        cv2.imwrite(str(carpeta / nombre), gondola(vacio)[0])
+    (carpeta / "notas.txt").write_text("no es una foto")
+    call_command("simular_camara", str(carpeta), pasillo="3", gondola="14B")
+    camara = Camera.objects.get()
+    assert (camara.pasillo, camara.gondola) == ("3", "14B")
+    assert Analysis.objects.count() == 2  # ignora lo que no es foto
+    assert all(a.created_by is None and a.photo_name.endswith(".jpg") for a in Analysis.objects.all())
+    assert "2 de 2" in capsys.readouterr().out
+
+
+def test_simular_camara_rechaza_una_carpeta_sin_fotos(tmp_path):
+    with pytest.raises(CommandError, match="No hay fotos"):
+        call_command("simular_camara", str(tmp_path), pasillo="3", gondola="14B")
+
+
+def test_gondola_tapada_se_rechaza_y_no_toca_la_alerta_abierta(client, analyzer, monkeypatch):
+    # #77: una persona frente a casi toda la góndola no permite afirmar un quiebre ni confirmar una reposición.
+    client.force_login(make_user("1-9", JEFE))
+    open_alert = analyzer(client)
+    monkeypatch.setattr(views, "get_person_detector", lambda: Hider((80.0, 0.0, 720.0, 600.0)))
+    response = client.post(reverse("analisis"), {"pasillo": "3", "gondola": "14B", "foto": photo(EMPTIED)})
+    assert "tapada en" in response.content.decode()
+    assert Analysis.objects.count() == 1
+    open_alert.refresh_from_db()
+    assert open_alert.estado == ACTIVA
+
+
+
+def test_los_pesos_de_personas_por_defecto_son_los_versionados():
+    from web import settings as web_settings
+
+    assert web_settings.PERSON_WEIGHTS.name == "yolo26n.pt" and web_settings.PERSON_WEIGHTS.is_file()
+
+
+# --- #96: paginación de «Últimos análisis» y #94: botones Anterior/Siguiente ---
+
+def make_analysis(pasillo="3", gondola="14B", estado="", free=0.5):
+    return Analysis.objects.create(pasillo=pasillo, gondola=gondola, photo_name="f.jpg", free_fraction=free,
+                                   critical=bool(estado), result={"shelves": []}, estado=estado)
+
+
+def test_ultimos_analisis_se_paginan_de_a_25(client):
+    client.force_login(make_user("2-7", JEFE))
+    for _ in range(30):
+        make_analysis()
+    first = client.get(reverse("analisis"))
+    assert len(first.context["analisis"]) == 25 and "Página 1 de 2" in first.content.decode()
+    second = client.get(reverse("analisis"), {"pagina": 2})
+    assert len(second.context["analisis"]) == 5 and "Página 2 de 2" in second.content.decode()
+    assert len(client.get(reverse("analisis"), {"pagina": "x"}).context["analisis"]) == 25  # página inválida: la primera
+
+
+def test_botones_anterior_y_siguiente_recorren_la_misma_gondola_por_fecha(client):
+    client.force_login(make_user("1-9", REPONEDOR))
+    old, middle, new = make_analysis(), make_analysis(), make_analysis()
+    make_analysis(gondola="15")  # otra góndola: no se recorre
+    page = client.get(reverse("analisis_detalle", args=[middle.pk]))
+    nav = page.context["nav"]
+    assert (nav["anterior"], nav["siguiente"], nav["posicion"], nav["total"]) == (old, new, 2, 3)
+    assert 'id="nav-prev"' in page.content.decode() and 'id="nav-next"' in page.content.decode()
+    assert client.get(reverse("analisis_detalle", args=[old.pk])).context["nav"]["anterior"] is None
+
+
+def test_botones_recorren_las_alertas_abiertas_con_desde_alertas(client):
+    client.force_login(make_user("1-9", REPONEDOR))
+    mild = make_analysis(gondola="1", estado=ACTIVA, free=0.4)
+    severe = make_analysis(gondola="2", estado=ACTIVA, free=0.9)
+    make_analysis(gondola="3", estado=COMPLETADA)  # cerrada: no es una alerta abierta
+    nav = client.get(reverse("analisis_detalle", args=[severe.pk]), {"desde": "alertas"}).context["nav"]
+    assert (nav["anterior"], nav["siguiente"], nav["total"]) == (None, mild, 2)  # orden de CU02: la más libre primero
+
+
+def test_las_alertas_abren_la_foto_en_modo_alertas_y_el_modo_no_se_pierde(client):
+    client.force_login(make_user("1-9", REPONEDOR))
+    alert = make_analysis(estado=ACTIVA)
+    assert f'{reverse("analisis_detalle", args=[alert.pk])}?desde=alertas' in client.get(reverse("alertas")).content.decode()
+    page = client.get(reverse("analisis_detalle", args=[alert.pk]), {"desde": "alertas"}).content.decode()
+    assert f'name="next" value="{reverse("analisis_detalle", args=[alert.pk])}?desde=alertas"' in page  # tras Tomar, vuelve en el mismo modo
+
+
+def test_el_css_tiene_las_llaves_balanceadas():
+    css = (Path(views.__file__).parent / "static/web/app.css").read_text(encoding="utf-8")
+    assert css.count("{") == css.count("}")  # una } suelta invalidaba la regla siguiente
