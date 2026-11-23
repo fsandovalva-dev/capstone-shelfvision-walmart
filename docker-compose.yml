@@ -1,5 +1,5 @@
 # App web de ShelfVision AI: `docker compose up --build` (ver "Ejecución con Docker" del README).
-# Antes: DJANGO_SECRET_KEY en el entorno o en un .env (los pesos ya vienen en la imagen).
+# Antes: copiar .env.example a .env y completar DJANGO_SECRET_KEY (los pesos ya vienen en la imagen).
 services:
   web:
     build: .
@@ -7,7 +7,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?define DJANGO_SECRET_KEY}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?define DJANGO_SECRET_KEY en .env (ver .env.example)}
       DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
       DJANGO_HTTPS: ${DJANGO_HTTPS:-0}  # 1 solo detrás de TLS
     volumes:
